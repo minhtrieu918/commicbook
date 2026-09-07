@@ -1,0 +1,417 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Kiểm tra người dùng đang đăng nhập có vai trò admin hay không.
+    function isAdmin() {
+      return request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function isModerator() {
+      return request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role ==
+          'moderator';
+    }
+
+    function isStaff() {
+      return isAdmin() || isModerator();
+    }
+
+    function hasApprovedSellerProfile(userId) {
+      return exists(/databases/$(database)/documents/seller_profiles/$(userId)) &&
+        (!get(/databases/$(database)/documents/seller_profiles/$(userId)).data.keys()
+            .hasAny(['approvalStatus']) ||
+          get(/databases/$(database)/documents/seller_profiles/$(userId)).data.approvalStatus ==
+            'approved');
+    }
+
+    function isSeller() {
+      return request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role ==
+          'seller' && hasApprovedSellerProfile(request.auth.uid);
+    }
+
+    function validOrderStatus() {
+      return request.resource.data.status in [
+        'Chờ xác nhận',
+        'Đang xử lý',
+        'Đang giao',
+        'Đã giao',
+        'Đã hủy'
+      ];
+    }
+
+    // Thông tin xác thực chỉ thuộc Firebase Authentication. Không cho phép
+    // client ghi mật khẩu vào hồ sơ Firestore dưới bất kỳ dạng thông dụng nào.
+    function hasNoPasswordFields() {
+      return !request.resource.data.keys().hasAny([
+        'password',
+        'passwordHash',
+        'password_hash'
+      ]);
+    }
+
+    match /users/{userId} {
+      allow create: if request.auth != null && request.auth.uid == userId &&
+        request.resource.data.role == 'customer' && hasNoPasswordFields();
+      allow read: if request.auth != null &&
+        (request.auth.uid == userId || isStaff());
+      allow update: if
+        (isAdmin() && hasNoPasswordFields() &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['role', 'updatedAt']) &&
+          (
+            request.resource.data.role in ['customer', 'moderator', 'admin'] ||
+            (
+              request.resource.data.role == 'seller' &&
+              getAfter(/databases/$(database)/documents/seller_registration_requests/$(userId)).data.status ==
+                'approved' &&
+              getAfter(/databases/$(database)/documents/seller_profiles/$(userId)).data.approvalStatus ==
+                'approved'
+            )
+          )) ||
+        (request.auth != null && request.auth.uid == userId &&
+          hasNoPasswordFields() &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['fullName', 'phone', 'updatedAt']) &&
+          request.resource.data.fullName is string &&
+          request.resource.data.phone is string);
+      allow delete: if isAdmin();
+    }
+
+    // Nhật ký thao tác đặc quyền chỉ do Admin SDK ghi. Admin được phép đọc để
+    // kiểm tra, nhưng không client nào được tự tạo hoặc sửa lịch sử này.
+    match /admin_audit_logs/{logId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /seller_registration_requests/{userId} {
+      allow read: if request.auth != null &&
+        (request.auth.uid == userId || isAdmin());
+      allow create: if request.auth != null &&
+        request.auth.uid == userId &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status == 'pending' &&
+        get(/databases/$(database)/documents/users/$(userId)).data.role ==
+          'customer' &&
+        request.resource.data.keys().hasOnly([
+          'userId', 'fullName', 'businessName', 'phone', 'address',
+          'bankAccount', 'verificationDocument', 'status', 'createdAt',
+          'updatedAt'
+        ]);
+      allow update: if
+        (isAdmin() &&
+          resource.data.status == 'pending' &&
+          request.resource.data.userId == resource.data.userId &&
+          request.resource.data.status in ['approved', 'rejected'] &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'status', 'rejectionReason', 'reviewedBy', 'reviewedAt', 'updatedAt'
+          ]) &&
+          (
+            request.resource.data.status == 'rejected' ||
+            (
+              getAfter(/databases/$(database)/documents/users/$(userId)).data.role ==
+                'seller' &&
+              getAfter(/databases/$(database)/documents/seller_profiles/$(userId)).data.approvalStatus ==
+                'approved'
+            )
+          )) ||
+        (request.auth != null && request.auth.uid == userId &&
+          resource.data.status == 'rejected' &&
+          request.resource.data.userId == request.auth.uid &&
+          request.resource.data.status == 'pending' &&
+          get(/databases/$(database)/documents/users/$(userId)).data.role ==
+            'customer' &&
+          request.resource.data.keys().hasOnly([
+            'userId', 'fullName', 'businessName', 'phone', 'address',
+            'bankAccount', 'verificationDocument', 'status', 'createdAt',
+            'updatedAt'
+          ]) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'fullName', 'businessName', 'phone', 'address', 'bankAccount',
+            'verificationDocument', 'status', 'createdAt', 'updatedAt',
+            'rejectionReason', 'reviewedBy', 'reviewedAt'
+          ]));
+      allow delete: if isAdmin();
+    }
+
+    match /seller_profiles/{sellerId} {
+      allow read: if request.auth != null &&
+        (!resource.data.keys().hasAny(['approvalStatus']) ||
+          resource.data.approvalStatus == 'approved' ||
+          request.auth.uid == sellerId || isAdmin());
+      allow create: if isAdmin() &&
+        request.resource.data.userId == sellerId &&
+        request.resource.data.approvalStatus == 'approved' &&
+        getAfter(/databases/$(database)/documents/users/$(sellerId)).data.role ==
+          'seller' &&
+        getAfter(/databases/$(database)/documents/seller_registration_requests/$(sellerId)).data.status ==
+          'approved';
+      allow update: if isAdmin() ||
+        (request.auth != null && request.auth.uid == sellerId &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'fullName', 'businessName', 'phone', 'address', 'updatedAt'
+          ]));
+      allow delete: if isAdmin();
+    }
+
+    match /saved_comics/{savedId} {
+      allow read: if request.auth != null &&
+        resource.data.userId == request.auth.uid;
+      allow create: if request.auth != null &&
+        request.resource.data.userId == request.auth.uid;
+      allow update: if false;
+      allow delete: if request.auth != null &&
+        resource.data.userId == request.auth.uid;
+    }
+
+    match /seller_feedback/{feedbackId} {
+      allow read: if request.auth != null &&
+        (resource.data.status == 'approved' ||
+          resource.data.userId == request.auth.uid || isStaff());
+      allow create: if request.auth != null &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status == 'pending' &&
+        request.resource.data.rating >= 1 &&
+        request.resource.data.rating <= 5;
+      allow update, delete: if isStaff();
+    }
+
+    match /follows/{followId} {
+      allow read: if request.auth != null &&
+        resource.data.userId == request.auth.uid;
+      allow create: if request.auth != null &&
+        request.resource.data.userId == request.auth.uid;
+      allow update: if false;
+      allow delete: if request.auth != null &&
+        resource.data.userId == request.auth.uid;
+    }
+
+    match /comic_genres/{itemId} {
+      allow read: if request.auth != null;
+      allow write: if isAdmin();
+    }
+
+    match /comic_conditions/{itemId} {
+      allow read: if request.auth != null;
+      allow write: if isAdmin();
+    }
+
+    match /comic_editions/{itemId} {
+      allow read: if request.auth != null;
+      allow write: if isAdmin();
+    }
+
+    match /comic_merchandises/{itemId} {
+      allow read: if request.auth != null;
+      allow write: if isAdmin();
+    }
+
+    match /auction_configs/{itemId} {
+      allow read: if request.auth != null;
+      allow write: if isAdmin();
+    }
+
+    match /auction_criteria/{itemId} {
+      allow read: if request.auth != null;
+      allow write: if isAdmin();
+    }
+
+    match /seller_subscription_plans/{itemId} {
+      allow read: if request.auth != null;
+      allow write: if isAdmin();
+    }
+
+    // Danh mục truyện do admin thêm/sửa, tất cả mọi người đăng nhập đều xem được.
+    match /comics/{comicId} {
+      allow read: if request.auth != null;
+      allow create, delete: if isStaff();
+      allow update: if isStaff() ||
+        (isSeller() && resource.data.sellerUid == request.auth.uid &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['price', 'stock', 'status', 'updatedAt']) &&
+          request.resource.data.price > 0 &&
+          request.resource.data.stock >= 0 &&
+          request.resource.data.status in ['active', 'paused', 'unavailable']) ||
+        (request.auth != null && resource.data.status == 'active' &&
+          resource.data.stock > 0 &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['stock', 'lastOrderId', 'updatedAt']) &&
+          request.resource.data.stock == resource.data.stock - 1 &&
+          request.resource.data.lastOrderId is string &&
+          existsAfter(/databases/$(database)/documents/orders/$(request.resource.data.lastOrderId)) &&
+          getAfter(/databases/$(database)/documents/orders/$(request.resource.data.lastOrderId)).data.userId ==
+            request.auth.uid &&
+          getAfter(/databases/$(database)/documents/orders/$(request.resource.data.lastOrderId)).data.comicId ==
+            comicId);
+    }
+
+    match /orders/{orderId} {
+      allow create: if request.auth != null &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.buyerEmail == request.auth.token.email &&
+        request.resource.data.status == 'Chờ xác nhận' &&
+        request.resource.data.price > 0 &&
+        request.resource.data.sellerUid is string &&
+        (
+          (exists(/databases/$(database)/documents/comics/$(request.resource.data.comicId)) &&
+            getAfter(/databases/$(database)/documents/comics/$(request.resource.data.comicId)).data.sellerUid ==
+              request.resource.data.sellerUid &&
+            getAfter(/databases/$(database)/documents/comics/$(request.resource.data.comicId)).data.price ==
+              request.resource.data.price &&
+            getAfter(/databases/$(database)/documents/comics/$(request.resource.data.comicId)).data.lastOrderId ==
+              orderId) ||
+          (!exists(/databases/$(database)/documents/comics/$(request.resource.data.comicId)) &&
+            request.resource.data.sellerUid == '')
+        );
+      allow read: if request.auth != null &&
+        (resource.data.userId == request.auth.uid ||
+          resource.data.sellerUid == request.auth.uid || isStaff());
+      allow update: if (isStaff() ||
+          (request.auth != null && resource.data.sellerUid == request.auth.uid)) &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'updatedAt']) &&
+        validOrderStatus();
+      allow delete: if isStaff();
+    }
+
+    match /sell_requests/{requestId} {
+      // Người dùng chỉ tạo được yêu cầu của chính họ, với trạng thái Chờ duyệt.
+      allow create: if isSeller() &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status == 'Chờ duyệt';
+      allow read: if request.auth != null &&
+        (resource.data.userId == request.auth.uid || isStaff());
+      // Admin là người duy nhất đổi trạng thái sang Đã duyệt / Từ chối.
+      allow update, delete: if isStaff();
+    }
+
+    // Yêu cầu và phiên đấu giá là hai trạng thái nghiệp vụ riêng. Mọi thay đổi
+    // tiền cọc, giá hiện tại và kết quả đều do Cloud Functions (Admin SDK) ghi.
+    match /auction_requests/{requestId} {
+      allow read: if request.auth != null &&
+        (resource.data.sellerUid == request.auth.uid || isStaff());
+      allow write: if false;
+    }
+
+    match /auctions/{auctionId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+
+    match /auction_bids/{bidId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+
+    match /auction_deposits/{depositId} {
+      allow read: if request.auth != null &&
+        (resource.data.userId == request.auth.uid || isStaff());
+      allow write: if false;
+    }
+
+    match /exchange_posts/{postId} {
+      allow read: if request.auth != null;
+      allow create: if isStaff() ||
+        (request.auth != null &&
+          request.resource.data.userId == request.auth.uid &&
+          request.resource.data.status == 'active');
+      allow update, delete: if isStaff() ||
+        (request.auth != null && resource.data.userId == request.auth.uid);
+    }
+
+    match /exchange_requests/{requestId} {
+      allow read: if request.auth != null &&
+        request.auth.uid in resource.data.participantIds;
+      allow create: if request.auth != null &&
+        request.resource.data.requesterUid == request.auth.uid &&
+        request.auth.uid in request.resource.data.participantIds &&
+        request.resource.data.status == 'pending';
+      allow update: if request.auth != null &&
+        resource.data.recipientUid == request.auth.uid &&
+        resource.data.status == 'pending' &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'status', 'respondedAt', 'updatedAt'
+        ]) && request.resource.data.status in ['accepted', 'rejected'];
+      allow delete: if isStaff();
+    }
+
+    match /notifications/{notificationId} {
+      allow read: if request.auth != null &&
+        (resource.data.userId == request.auth.uid || isStaff());
+      allow create, delete: if isStaff();
+      allow update: if request.auth != null &&
+        resource.data.userId == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['isRead', 'readAt']) &&
+        request.resource.data.isRead == true;
+    }
+
+    match /wallets/{userId} {
+      allow read: if request.auth != null &&
+        (request.auth.uid == userId || isStaff());
+      allow create: if isStaff() ||
+        (request.auth != null && request.auth.uid == userId &&
+          request.resource.data.userId == request.auth.uid &&
+          request.resource.data.balance == 0 &&
+          request.resource.data.withdrawableBalance == 0 &&
+          request.resource.data.heldBalance == 0);
+      allow delete: if isStaff();
+      allow update: if isStaff() ||
+        (request.auth != null && request.auth.uid == userId &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'withdrawableBalance', 'lastRequestId', 'updatedAt'
+          ]) &&
+          request.resource.data.withdrawableBalance <
+            resource.data.withdrawableBalance &&
+          existsAfter(/databases/$(database)/documents/wallet_requests/$(request.resource.data.lastRequestId)) &&
+          getAfter(/databases/$(database)/documents/wallet_requests/$(request.resource.data.lastRequestId)).data.userId ==
+            request.auth.uid);
+    }
+
+    match /wallet_requests/{requestId} {
+      allow read: if request.auth != null &&
+        (resource.data.userId == request.auth.uid || isStaff());
+      allow create: if request.auth != null &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.type in ['deposit', 'withdraw'] &&
+        request.resource.data.amount > 0 &&
+        request.resource.data.status == 'pending' &&
+        (request.resource.data.type == 'deposit' ||
+          getAfter(/databases/$(database)/documents/wallets/$(request.auth.uid)).data.lastRequestId ==
+            requestId);
+      allow update, delete: if isStaff();
+    }
+
+    match /wallet_transactions/{transactionId} {
+      allow read: if request.auth != null &&
+        (resource.data.userId == request.auth.uid || isStaff());
+      allow write: if isStaff();
+    }
+
+    match /chats/{chatId} {
+      allow read: if request.auth != null &&
+        request.auth.uid in resource.data.participantIds;
+      allow create: if request.auth != null &&
+        request.auth.uid in request.resource.data.participantIds;
+      allow update: if request.auth != null &&
+        request.auth.uid in resource.data.participantIds &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'lastMessage', 'lastSenderUid', 'updatedAt'
+        ]);
+      allow delete: if isStaff();
+
+      match /messages/{messageId} {
+        allow read: if request.auth != null &&
+          request.auth.uid in
+            get(/databases/$(database)/documents/chats/$(chatId)).data.participantIds;
+        allow create: if request.auth != null &&
+          request.resource.data.senderUid == request.auth.uid &&
+          request.auth.uid in
+            get(/databases/$(database)/documents/chats/$(chatId)).data.participantIds;
+        allow update, delete: if false;
+      }
+    }
+  }
+}

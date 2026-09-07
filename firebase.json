@@ -1,0 +1,23 @@
+{
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "default",
+      "ignore": [
+        "node_modules",
+        ".git",
+        "firebase-debug.log",
+        "firebase-debug.*.log"
+      ],
+      "predeploy": [
+        "/opt/homebrew/bin/node --check \"$RESOURCE_DIR/index.js\"",
+        "/opt/homebrew/bin/node --check \"$RESOURCE_DIR/auction.js\"",
+        "/opt/homebrew/bin/node --test \"$RESOURCE_DIR/password_policy.test.js\""
+      ]
+    }
+  ],
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  }
+}
